@@ -1,4 +1,6 @@
-# go_webostv
+# webostv : A Go Package
+
+![webostv banner](_asset/go_webostv.webp)
 
 [![Go Reference](https://pkg.go.dev/badge/github.com/suapapa/go_webostv.svg)](https://pkg.go.dev/github.com/suapapa/go_webostv)
 
