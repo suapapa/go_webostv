@@ -1,5 +1,7 @@
 # go_webostv
 
+[![Go Reference](https://pkg.go.dev/badge/github.com/suapapa/go_webostv.svg)](https://pkg.go.dev/github.com/suapapa/go_webostv)
+
 A Go port of [PyWebOSTV](https://github.com/supersaiyanmode/PyWebOSTV), a library to remote control LG WebOS TVs.
 
 ## Features
