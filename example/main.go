@@ -10,11 +10,12 @@ import (
 )
 
 func main() {
-	ctx := context.Background()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	defer cancel()
 
 	// Discovery
 	fmt.Println("Discovering TVs...")
-	clients, err := webostv.Discover(ctx, false)
+	clients, err := webostv.Discover(ctx) // New API: Discover(ctx, opts...)
 	if err != nil {
 		log.Fatalf("discovery error: %v", err)
 	}
@@ -25,7 +26,7 @@ func main() {
 	}
 
 	client := clients[0]
-	fmt.Printf("Connecting to %s...\n", client.URL)
+	fmt.Printf("Connecting to %s...\n", client.URL())
 
 	err = client.Connect()
 	if err != nil {
@@ -35,7 +36,8 @@ func main() {
 
 	// Registration
 	store := make(map[string]string)
-	statusChan, errChan := client.Register(store)
+	// New API: Register(ctx, store)
+	statusChan, errChan := client.Register(ctx, store)
 
 	select {
 	case status := <-statusChan:
@@ -50,21 +52,22 @@ func main() {
 		}
 	case err := <-errChan:
 		log.Fatalf("registration error: %v", err)
-	case <-time.After(60 * time.Second):
-		log.Fatal("registration timeout")
+	case <-ctx.Done():
+		log.Fatal("registration timeout or cancelled")
 	}
 
 	// Use controls
 	media := &webostv.MediaControl{Control: webostv.Control{Client: client}}
 	
-	vol, err := media.GetVolume()
+	// New API: methods take context
+	vol, err := media.GetVolume(ctx)
 	if err == nil {
-		fmt.Printf("Current volume: %v\n", vol["volume"])
+		fmt.Printf("Current volume: %v (Mute: %v)\n", vol.Volume, vol.Mute)
 	}
 
 	system := &webostv.SystemControl{Control: webostv.Control{Client: client}}
-	info, err := system.Info()
+	info, err := system.Info(ctx)
 	if err == nil {
-		fmt.Printf("System Info: %v\n", info)
+		fmt.Printf("System Info: %+v\n", info)
 	}
 }

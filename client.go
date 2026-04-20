@@ -1,9 +1,11 @@
 package webostv
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -12,66 +14,19 @@ import (
 )
 
 const (
-	Signature = "eyJhbGdvcml0aG0iOiJSU0EtU0hBMjU2Iiwia2V5SWQiOiJ0ZXN0LXNpZ25pbm" +
-		"ctY2VydCIsInNpZ25hdHVyZVZlcnNpb24iOjF9.hrVRgjCwXVvE2OOSpDZ58hR" +
-		"+59aFNwYDyjQgKk3auukd7pcegmE2CzPCa0bJ0ZsRAcKkCTJrWo5iDzNhMBWRy" +
-		"aMOv5zWSrthlf7G128qvIlpMT0YNY+n/FaOHE73uLrS/g7swl3/qH/BGFG2Hu4" +
-		"RlL48eb3lLKqTt2xKHdCs6Cd4RMfJPYnzgvI4BNrFUKsjkcu+WD4OO2A27Pq1n" +
-		"50cMchmcaXadJhGrOqH5YmHdOCj5NSHzJYrsW0HPlpuAx/ECMeIZYDh6RMqaFM" +
-		"2DXzdKX9NmmyqzJ3o/0lkk/N97gfVRLW5hA29yeAwaCViZNCP8iC9aO0q9fQoj" +
-		"oa7NQnAtw=="
+	// DefaultHandshakeTimeout is the default timeout for websocket handshake.
+	DefaultHandshakeTimeout = 10 * time.Second
+	// DefaultWriteWait is the default time to wait for a message to be written.
+	DefaultWriteWait = 10 * time.Second
 )
 
-var RegistrationPayload = map[string]interface{}{
-	"forcePairing": false,
-	"manifest": map[string]interface{}{
-		"appVersion":      "1.1",
-		"manifestVersion": 1,
-		"permissions": []string{
-			"LAUNCH", "LAUNCH_WEBAPP", "APP_TO_APP", "CLOSE", "TEST_OPEN", "TEST_PROTECTED",
-			"CONTROL_AUDIO", "CONTROL_DISPLAY", "CONTROL_INPUT_JOYSTICK", "CONTROL_INPUT_MEDIA_RECORDING",
-			"CONTROL_INPUT_MEDIA_PLAYBACK", "CONTROL_INPUT_TV", "CONTROL_POWER", "READ_APP_STATUS",
-			"READ_CURRENT_CHANNEL", "READ_INPUT_DEVICE_LIST", "READ_NETWORK_STATE", "READ_RUNNING_APPS",
-			"READ_TV_CHANNEL_LIST", "WRITE_NOTIFICATION_TOAST", "READ_POWER_STATE", "READ_COUNTRY_INFO",
-			"READ_SETTINGS", "CONTROL_TV_SCREEN", "CONTROL_TV_STANBY", "CONTROL_FAVORITE_GROUP",
-			"CONTROL_USER_INFO", "CHECK_BLUETOOTH_DEVICE", "CONTROL_BLUETOOTH", "CONTROL_TIMER_INFO",
-			"STB_INTERNAL_CONNECTION", "CONTROL_RECORDING", "READ_RECORDING_STATE", "WRITE_RECORDING_LIST",
-			"READ_RECORDING_LIST", "READ_RECORDING_SCHEDULE", "WRITE_RECORDING_SCHEDULE", "READ_STORAGE_DEVICE_LIST",
-			"READ_TV_PROGRAM_INFO", "CONTROL_BOX_CHANNEL", "READ_TV_ACR_AUTH_TOKEN", "READ_TV_CONTENT_STATE",
-			"READ_TV_CURRENT_TIME", "ADD_LAUNCHER_CHANNEL", "SET_CHANNEL_SKIP", "RELEASE_CHANNEL_SKIP",
-			"CONTROL_CHANNEL_BLOCK", "DELETE_SELECT_CHANNEL", "CONTROL_CHANNEL_GROUP", "SCAN_TV_CHANNELS",
-			"CONTROL_TV_POWER", "CONTROL_WOL",
-		},
-		"signatures": []map[string]interface{}{
-			{
-				"signature":        Signature,
-				"signatureVersion": 1,
-			},
-		},
-		"signed": map[string]interface{}{
-			"appId":   "com.lge.test",
-			"created": "20140509",
-			"localizedAppNames": map[string]string{
-				"":      "LG Remote App",
-				"ko-KR": "리모컨 앱",
-				"zxx-XX": "ЛГ Rэмotэ AПП",
-			},
-			"localizedVendorNames": map[string]string{
-				"": "LG Electronics",
-			},
-			"permissions": []string{
-				"TEST_SECURE", "CONTROL_INPUT_TEXT", "CONTROL_MOUSE_AND_KEYBOARD", "READ_INSTALLED_APPS",
-				"READ_LGE_SDX", "READ_NOTIFICATIONS", "SEARCH", "WRITE_SETTINGS", "WRITE_SETTINGS",
-				"WRITE_NOTIFICATION_ALERT", "CONTROL_POWER", "READ_CURRENT_CHANNEL", "READ_RUNNING_APPS",
-				"READ_UPDATE_INFO", "UPDATE_FROM_REMOTE_APP", "READ_LGE_TV_INPUT_EVENTS", "READ_TV_CURRENT_TIME",
-			},
-			"serial":   "2f930e2d2cfe083771f68e4fe7bb07",
-			"vendorId": "com.lge",
-		},
-	},
-	"pairingType": "PROMPT",
-}
+var (
+	ErrConnectionClosed = errors.New("connection closed")
+	ErrTimeout          = errors.New("timeout")
+	ErrInvalidResponse  = errors.New("invalid response from TV")
+)
 
+// RegistrationStatus represents the status during the registration process.
 type RegistrationStatus int
 
 const (
@@ -79,55 +34,113 @@ const (
 	Registered
 )
 
+// Message is the basic unit of communication with WebOS TV.
 type Message struct {
-	Type    string      `json:"type"`
-	ID      string      `json:"id"`
-	URI     string      `json:"uri,omitempty"`
-	Payload interface{} `json:"payload,omitempty"`
+	Type    string          `json:"type"`
+	ID      string          `json:"id"`
+	URI     string          `json:"uri,omitempty"`
+	Payload json.RawMessage `json:"payload,omitempty"`
 }
 
+// Client is a WebOS TV client.
 type Client struct {
-	URL  string
+	url string
+	ctx context.Context
+	cancel context.CancelFunc
+
 	conn *websocket.Conn
+	connMu sync.Mutex
 
-	waiters      map[string]chan *Message
-	waiterLock   sync.Mutex
-	subscribers  map[string]subscription
-	subscriberLock sync.Mutex
+	waiters    map[string]chan *Message
+	waiterMu   sync.RWMutex
 
-	sendLock sync.Mutex
+	subscribers map[string]subscription
+	subscriberMu sync.RWMutex
 
-	done chan struct{}
+	writeMu sync.Mutex
+
+	options clientOptions
 }
 
 type subscription struct {
 	uri      string
-	callback func(interface{})
+	callback func(json.RawMessage)
 }
 
-func NewClient(host string, secure bool) *Client {
-	var wsURL string
-	if secure {
-		wsURL = fmt.Sprintf("wss://%s:3001/", host)
-	} else {
-		wsURL = fmt.Sprintf("ws://%s:3000/", host)
+type clientOptions struct {
+	handshakeTimeout time.Duration
+	secure           bool
+}
+
+// Option is a functional option for Client.
+type Option func(*clientOptions)
+
+// WithSecure sets whether to use a secure (WSS) connection.
+func WithSecure(secure bool) Option {
+	return func(o *clientOptions) {
+		o.secure = secure
 	}
+}
+
+// WithHandshakeTimeout sets the timeout for the websocket handshake.
+func WithHandshakeTimeout(d time.Duration) Option {
+	return func(o *clientOptions) {
+		o.handshakeTimeout = d
+	}
+}
+
+// NewClient creates a new WebOS TV client.
+func NewClient(host string, opts ...Option) *Client {
+	options := clientOptions{
+		handshakeTimeout: DefaultHandshakeTimeout,
+		secure:           false,
+	}
+	for _, opt := range opts {
+		opt(&options)
+	}
+
+	var wsURL string
+	if options.secure {
+		if strings.Contains(host, ":") {
+			wsURL = fmt.Sprintf("wss://%s/", host)
+		} else {
+			wsURL = fmt.Sprintf("wss://%s:3001/", host)
+		}
+	} else {
+		if strings.Contains(host, ":") {
+			wsURL = fmt.Sprintf("ws://%s/", host)
+		} else {
+			wsURL = fmt.Sprintf("ws://%s:3000/", host)
+		}
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
 
 	return &Client{
-		URL:         wsURL,
+		url:         wsURL,
+		ctx:         ctx,
+		cancel:      cancel,
 		waiters:     make(map[string]chan *Message),
 		subscribers: make(map[string]subscription),
-		done:        make(chan struct{}),
+		options:     options,
 	}
 }
 
+// Connect establishes a connection to the TV.
 func (c *Client) Connect() error {
-	dialer := websocket.DefaultDialer
-	dialer.HandshakeTimeout = 10 * time.Second
+	c.connMu.Lock()
+	defer c.connMu.Unlock()
 
-	conn, _, err := dialer.Dial(c.URL, nil)
+	if c.conn != nil {
+		return nil
+	}
+
+	dialer := websocket.DefaultDialer
+	dialer.HandshakeTimeout = c.options.handshakeTimeout
+
+	conn, _, err := dialer.Dial(c.url, nil)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to dial %s: %w", c.url, err)
 	}
 	c.conn = conn
 
@@ -136,27 +149,39 @@ func (c *Client) Connect() error {
 	return nil
 }
 
+// Close closes the connection to the TV.
 func (c *Client) Close() error {
-	close(c.done)
+	c.cancel()
+	c.connMu.Lock()
+	defer c.connMu.Unlock()
+
 	if c.conn != nil {
-		return c.conn.Close()
+		err := c.conn.Close()
+		c.conn = nil
+		return err
 	}
 	return nil
 }
 
+// URL returns the URL the client is connected to.
+func (c *Client) URL() string {
+	return c.url
+}
+
 func (c *Client) readLoop() {
 	defer func() {
-		c.waiterLock.Lock()
+		c.waiterMu.Lock()
 		for id, ch := range c.waiters {
 			close(ch)
 			delete(c.waiters, id)
 		}
-		c.waiterLock.Unlock()
+		c.waiterMu.Unlock()
+		_ = c.Close()
 	}()
 
 	for {
 		select {
-		case <-c.done:
+		case <-c.ctx.Done():
 			return
 		default:
 			_, data, err := c.conn.ReadMessage()
@@ -175,28 +200,31 @@ func (c *Client) readLoop() {
 }
 
 func (c *Client) handleMessage(msg *Message) {
-	c.waiterLock.Lock()
+	c.waiterMu.RLock()
 	ch, ok := c.waiters[msg.ID]
-	c.waiterLock.Unlock()
+	c.waiterMu.RUnlock()
 
 	if ok {
 		select {
 		case ch <- msg:
+		case <-c.ctx.Done():
 		default:
+			// channel full, drop message or handle overflow
 		}
 		return
 	}
 
-	c.subscriberLock.Lock()
+	c.subscriberMu.RLock()
 	sub, ok := c.subscribers[msg.ID]
-	c.subscriberLock.Unlock()
+	c.subscriberMu.RUnlock()
 
 	if ok {
-		sub.callback(msg.Payload)
+		go sub.callback(msg.Payload)
 	}
 }
 
-func (c *Client) Register(store map[string]string) (<-chan RegistrationStatus, <-chan error) {
+// Register performs the registration with the TV.
+func (c *Client) Register(ctx context.Context, store map[string]string) (<-chan RegistrationStatus, <-chan error) {
 	statusChan := make(chan RegistrationStatus)
 	errChan := make(chan error, 1)
 
@@ -213,39 +241,53 @@ func (c *Client) Register(store map[string]string) (<-chan RegistrationStatus, <
 		defer close(statusChan)
 		defer close(errChan)
 
-		respChan, err := c.SendMessage("register", "", payload)
+		respChan, _, err := c.SendMessage(ctx, "", "register", "", payload)
 		if err != nil {
-			errChan <- err
+			errChan <- fmt.Errorf("failed to send registration message: %w", err)
 			return
 		}
 
 		for {
 			select {
-			case item := <-respChan:
-				if item == nil {
-					errChan <- errors.New("connection closed")
-					return
-				}
-
-				p, ok := item.Payload.(map[string]interface{})
+			case <-ctx.Done():
+				errChan <- ctx.Err()
+				return
+			case <-c.ctx.Done():
+				errChan <- ErrConnectionClosed
+				return
+			case item, ok := <-respChan:
 				if !ok {
-					errChan <- errors.New("invalid payload")
+					errChan <- ErrConnectionClosed
 					return
 				}
 
-				if p["pairingType"] == "PROMPT" {
-					statusChan <- Prompted
+				var p struct {
+					PairingType string `json:"pairingType"`
+					ClientKey   string `json:"client-key"`
+					Error       string `json:"error"`
+				}
+				if err := json.Unmarshal(item.Payload, &p); err != nil {
+					errChan <- fmt.Errorf("failed to unmarshal registration payload: %w", err)
+					return
+				}
+
+				if p.PairingType == "PROMPT" {
+					select {
+					case statusChan <- Prompted:
+					case <-ctx.Done():
+						return
+					}
 				} else if item.Type == "registered" {
-					store["client_key"] = p["client-key"].(string)
-					statusChan <- Registered
+					store["client_key"] = p.ClientKey
+					select {
+					case statusChan <- Registered:
+					case <-ctx.Done():
+					}
 					return
 				} else if item.Type == "error" {
-					errChan <- fmt.Errorf("registration error: %v", p["error"])
+					errChan <- fmt.Errorf("registration error: %s", p.Error)
 					return
 				}
-			case <-time.After(60 * time.Second):
-				errChan <- errors.New("timeout")
-				return
 			}
 		}
 	}()
@@ -253,89 +295,117 @@ func (c *Client) Register(store map[string]string) (<-chan RegistrationStatus, <
 	return statusChan, errChan
 }
 
-func (c *Client) Request(uri string, payload interface{}, timeout time.Duration) (*Message, error) {
-	respChan, err := c.SendMessage("request", uri, payload)
+// Request sends a request and waits for a single response.
+func (c *Client) Request(ctx context.Context, uri string, payload interface{}) (*Message, error) {
+	respChan, id, err := c.SendMessage(ctx, "", "request", uri, payload)
 	if err != nil {
 		return nil, err
 	}
+	defer func() {
+		c.waiterMu.Lock()
+		delete(c.waiters, id)
+		c.waiterMu.Unlock()
+	}()
 
 	select {
-	case resp := <-respChan:
-		if resp == nil {
-			return nil, errors.New("connection closed")
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-c.ctx.Done():
+		return nil, ErrConnectionClosed
+	case resp, ok := <-respChan:
+		if !ok {
+			return nil, ErrConnectionClosed
 		}
 		if resp.Type == "error" {
-			return nil, fmt.Errorf("error from tv: %v", resp.Payload)
+			return nil, fmt.Errorf("%w: %s", ErrInvalidResponse, string(resp.Payload))
 		}
 		return resp, nil
-	case <-time.After(timeout):
-		return nil, errors.New("timeout")
 	}
 }
 
-func (c *Client) SendMessage(requestType, uri string, payload interface{}) (<-chan *Message, error) {
-	id := uuid.New().String()
+// SendMessage sends a message to the TV. If id is empty, a new UUID is generated.
+func (c *Client) SendMessage(ctx context.Context, id, requestType, uri string, payload interface{}) (<-chan *Message, string, error) {
+	if id == "" {
+		id = uuid.New().String()
+	}
+	
+	rawPayload, err := json.Marshal(payload)
+	if err != nil {
+		return nil, "", fmt.Errorf("failed to marshal payload: %w", err)
+	}
+
 	msg := Message{
 		Type:    requestType,
 		ID:      id,
-		Payload: payload,
+		Payload: rawPayload,
 	}
 	if uri != "" {
 		msg.URI = uri
 	}
 
 	ch := make(chan *Message, 10)
-	c.waiterLock.Lock()
+	c.waiterMu.Lock()
 	c.waiters[id] = ch
-	c.waiterLock.Unlock()
+	c.waiterMu.Unlock()
 
-	c.sendLock.Lock()
-	err := c.conn.WriteJSON(msg)
-	c.sendLock.Unlock()
+	c.writeMu.Lock()
+	err = c.conn.WriteJSON(msg)
+	c.writeMu.Unlock()
 
 	if err != nil {
-		c.waiterLock.Lock()
+		c.waiterMu.Lock()
 		delete(c.waiters, id)
-		c.waiterLock.Unlock()
-		return nil, err
+		c.waiterMu.Unlock()
+		return nil, "", fmt.Errorf("failed to write JSON: %w", err)
 	}
 
-	return ch, nil
+	return ch, id, nil
 }
 
-func (c *Client) Subscribe(uri string, callback func(interface{})) (string, error) {
+// Subscribe subscribes to a URI.
+func (c *Client) Subscribe(uri string, callback func(json.RawMessage)) (string, error) {
 	id := uuid.New().String()
 
-	c.subscriberLock.Lock()
+	c.subscriberMu.Lock()
 	c.subscribers[id] = subscription{
 		uri:      uri,
 		callback: callback,
 	}
-	c.subscriberLock.Unlock()
+	c.subscriberMu.Unlock()
 
-	_, err := c.SendMessage("subscribe", uri, nil)
+	_, _, err := c.SendMessage(context.Background(), id, "subscribe", uri, nil)
 	if err != nil {
-		c.subscriberLock.Lock()
+		c.subscriberMu.Lock()
 		delete(c.subscribers, id)
-		c.subscriberLock.Unlock()
-		return "", err
+		c.subscriberMu.Unlock()
+		return "", fmt.Errorf("failed to send subscribe message: %w", err)
 	}
+
+	// For subscriptions, we don't want to use the waiter mechanism after the initial send,
+	// because we want all responses (including the first one) to go to the subscriber callback.
+	c.waiterMu.Lock()
+	delete(c.waiters, id)
+	c.waiterMu.Unlock()
 
 	return id, nil
 }
 
+// Unsubscribe removes a subscription.
 func (c *Client) Unsubscribe(id string) error {
-	c.subscriberLock.Lock()
+	c.subscriberMu.Lock()
 	sub, ok := c.subscribers[id]
 	if ok {
 		delete(c.subscribers, id)
 	}
-	c.subscriberLock.Unlock()
+	c.subscriberMu.Unlock()
 
 	if !ok {
 		return errors.New("subscription not found")
 	}
 
-	_, err := c.SendMessage("unsubscribe", sub.uri, nil)
-	return err
+	_, _, err := c.SendMessage(context.Background(), "", "unsubscribe", sub.uri, nil)
+	if err != nil {
+		return fmt.Errorf("failed to send unsubscribe message: %w", err)
+	}
+	return nil
 }

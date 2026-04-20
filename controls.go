@@ -1,150 +1,148 @@
 package webostv
 
 import (
+	"context"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
-	"time"
+	"sync"
 
 	"github.com/gorilla/websocket"
 )
 
+// Control is the base struct for all controls.
 type Control struct {
 	Client *Client
 }
 
-// MediaControl
+// MediaControl provides methods to control media and volume.
 type MediaControl struct {
 	Control
 }
 
-func (m *MediaControl) VolumeUp() error {
-	_, err := m.Client.Request("ssap://audio/volumeUp", nil, 5*time.Second)
+func (m *MediaControl) VolumeUp(ctx context.Context) error {
+	_, err := m.Client.Request(ctx, "ssap://audio/volumeUp", nil)
 	return err
 }
 
-func (m *MediaControl) VolumeDown() error {
-	_, err := m.Client.Request("ssap://audio/volumeDown", nil, 5*time.Second)
+func (m *MediaControl) VolumeDown(ctx context.Context) error {
+	_, err := m.Client.Request(ctx, "ssap://audio/volumeDown", nil)
 	return err
 }
 
-func (m *MediaControl) GetVolume() (map[string]interface{}, error) {
-	resp, err := m.Client.Request("ssap://audio/getVolume", nil, 5*time.Second)
+func (m *MediaControl) GetVolume(ctx context.Context) (*VolumeInfo, error) {
+	resp, err := m.Client.Request(ctx, "ssap://audio/getVolume", nil)
 	if err != nil {
 		return nil, err
 	}
-	p, ok := resp.Payload.(map[string]interface{})
-	if !ok {
-		return nil, errors.New("invalid response")
+	var info VolumeInfo
+	if err := json.Unmarshal(resp.Payload, &info); err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrInvalidResponse, err)
 	}
-	return p, nil
+	return &info, nil
 }
 
-func (m *MediaControl) SetVolume(volume int) error {
+func (m *MediaControl) SetVolume(ctx context.Context, volume int) error {
 	payload := map[string]interface{}{"volume": volume}
-	_, err := m.Client.Request("ssap://audio/setVolume", payload, 5*time.Second)
+	_, err := m.Client.Request(ctx, "ssap://audio/setVolume", payload)
 	return err
 }
 
-func (m *MediaControl) Mute(mute bool) error {
+func (m *MediaControl) Mute(ctx context.Context, mute bool) error {
 	payload := map[string]interface{}{"mute": mute}
-	_, err := m.Client.Request("ssap://audio/setMute", payload, 5*time.Second)
+	_, err := m.Client.Request(ctx, "ssap://audio/setMute", payload)
 	return err
 }
 
-func (m *MediaControl) Play() error {
-	_, err := m.Client.Request("ssap://media.controls/play", nil, 5*time.Second)
+func (m *MediaControl) Play(ctx context.Context) error {
+	_, err := m.Client.Request(ctx, "ssap://media.controls/play", nil)
 	return err
 }
 
-func (m *MediaControl) Pause() error {
-	_, err := m.Client.Request("ssap://media.controls/pause", nil, 5*time.Second)
+func (m *MediaControl) Pause(ctx context.Context) error {
+	_, err := m.Client.Request(ctx, "ssap://media.controls/pause", nil)
 	return err
 }
 
-func (m *MediaControl) Stop() error {
-	_, err := m.Client.Request("ssap://media.controls/stop", nil, 5*time.Second)
+func (m *MediaControl) Stop(ctx context.Context) error {
+	_, err := m.Client.Request(ctx, "ssap://media.controls/stop", nil)
 	return err
 }
 
-func (m *MediaControl) Rewind() error {
-	_, err := m.Client.Request("ssap://media.controls/rewind", nil, 5*time.Second)
+func (m *MediaControl) Rewind(ctx context.Context) error {
+	_, err := m.Client.Request(ctx, "ssap://media.controls/rewind", nil)
 	return err
 }
 
-func (m *MediaControl) FastForward() error {
-	_, err := m.Client.Request("ssap://media.controls/fastForward", nil, 5*time.Second)
+func (m *MediaControl) FastForward(ctx context.Context) error {
+	_, err := m.Client.Request(ctx, "ssap://media.controls/fastForward", nil)
 	return err
 }
 
-func (m *MediaControl) ListAudioOutputSources() []AudioOutputSource {
-	sources := []string{"tv_speaker", "external_speaker", "soundbar", "bt_soundbar", "tv_external_speaker"}
-	res := make([]AudioOutputSource, len(sources))
-	for i, s := range sources {
-		res[i] = AudioOutputSource{Source: s}
-	}
-	return res
-}
-
-func (m *MediaControl) GetAudioOutput() (*AudioOutputSource, error) {
-	resp, err := m.Client.Request("ssap://audio/getSoundOutput", nil, 5*time.Second)
+func (m *MediaControl) GetAudioOutput(ctx context.Context) (*AudioOutputSource, error) {
+	resp, err := m.Client.Request(ctx, "ssap://audio/getSoundOutput", nil)
 	if err != nil {
 		return nil, err
 	}
-	p, ok := resp.Payload.(map[string]interface{})
-	if !ok {
-		return nil, errors.New("invalid response")
+	var out AudioOutputSource
+	if err := json.Unmarshal(resp.Payload, &out); err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrInvalidResponse, err)
 	}
-	return &AudioOutputSource{Source: p["soundOutput"].(string)}, nil
+	return &out, nil
 }
 
-func (m *MediaControl) SetAudioOutput(source AudioOutputSource) error {
-	payload := map[string]interface{}{"output": source.Source}
-	_, err := m.Client.Request("ssap://audio/changeSoundOutput", payload, 5*time.Second)
+func (m *MediaControl) SetAudioOutput(ctx context.Context, output string) error {
+	payload := map[string]interface{}{"output": output}
+	_, err := m.Client.Request(ctx, "ssap://audio/changeSoundOutput", payload)
 	return err
 }
 
-// Subscriptions
-func (m *MediaControl) SubscribeVolume(callback func(map[string]interface{})) (string, error) {
-	return m.Client.Subscribe("ssap://audio/getVolume", func(p interface{}) {
-		if data, ok := p.(map[string]interface{}); ok {
-			callback(data)
+func (m *MediaControl) SubscribeVolume(callback func(*VolumeInfo)) (string, error) {
+	return m.Client.Subscribe("ssap://audio/getVolume", func(p json.RawMessage) {
+		var info VolumeInfo
+		if err := json.Unmarshal(p, &info); err == nil {
+			callback(&info)
 		}
 	})
 }
 
-// SystemControl
+// SystemControl provides methods for system-level operations.
 type SystemControl struct {
 	Control
 }
 
-func (s *SystemControl) PowerOff() error {
-	_, err := s.Client.Request("ssap://system/turnOff", nil, 5*time.Second)
+func (s *SystemControl) PowerOff(ctx context.Context) error {
+	_, err := s.Client.Request(ctx, "ssap://system/turnOff", nil)
 	return err
 }
 
-func (s *SystemControl) ScreenOff() error {
+func (s *SystemControl) ScreenOff(ctx context.Context) error {
 	payload := map[string]interface{}{"standbyMode": "active"}
-	_, err := s.Client.Request("ssap://com.webos.service.tvpower/power/turnOffScreen", payload, 5*time.Second)
+	_, err := s.Client.Request(ctx, "ssap://com.webos.service.tvpower/power/turnOffScreen", payload)
 	return err
 }
 
-func (s *SystemControl) ScreenOn() error {
+func (s *SystemControl) ScreenOn(ctx context.Context) error {
 	payload := map[string]interface{}{"standbyMode": "active"}
-	_, err := s.Client.Request("ssap://com.webos.service.tvpower/power/turnOnScreen", payload, 5*time.Second)
+	_, err := s.Client.Request(ctx, "ssap://com.webos.service.tvpower/power/turnOnScreen", payload)
 	return err
 }
 
-func (s *SystemControl) Info() (map[string]interface{}, error) {
-	resp, err := s.Client.Request("ssap://com.webos.service.update/getCurrentSWInformation", nil, 5*time.Second)
+func (s *SystemControl) Info(ctx context.Context) (*SWInformation, error) {
+	resp, err := s.Client.Request(ctx, "ssap://com.webos.service.update/getCurrentSWInformation", nil)
 	if err != nil {
 		return nil, err
 	}
-	return resp.Payload.(map[string]interface{}), nil
+	var info SWInformation
+	if err := json.Unmarshal(resp.Payload, &info); err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrInvalidResponse, err)
+	}
+	return &info, nil
 }
 
-func (s *SystemControl) Notify(message string, iconBytes []byte, iconExt string) error {
+func (s *SystemControl) Notify(ctx context.Context, message string, iconBytes []byte, iconExt string) error {
 	payload := map[string]interface{}{
 		"message": message,
 	}
@@ -152,38 +150,32 @@ func (s *SystemControl) Notify(message string, iconBytes []byte, iconExt string)
 		payload["iconData"] = base64.StdEncoding.EncodeToString(iconBytes)
 		payload["iconExtension"] = iconExt
 	}
-	_, err := s.Client.Request("ssap://system.notifications/createToast", payload, 5*time.Second)
+	_, err := s.Client.Request(ctx, "ssap://system.notifications/createToast", payload)
 	return err
 }
 
-// ApplicationControl
+// ApplicationControl provides methods to manage applications.
 type ApplicationControl struct {
 	Control
 }
 
-func (a *ApplicationControl) ListApps() ([]Application, error) {
-	resp, err := a.Client.Request("ssap://com.webos.applicationManager/listApps", nil, 5*time.Second)
+func (a *ApplicationControl) ListApps(ctx context.Context) ([]Application, error) {
+	resp, err := a.Client.Request(ctx, "ssap://com.webos.applicationManager/listApps", nil)
 	if err != nil {
 		return nil, err
 	}
-	p := resp.Payload.(map[string]interface{})
-	appsData := p["apps"].([]interface{})
-	apps := make([]Application, len(appsData))
-	for i, v := range appsData {
-		data := v.(map[string]interface{})
-		apps[i] = Application{
-			ID:    data["id"].(string),
-			Title: data["title"].(string),
-			Icon:  data["icon"].(string),
-			Data:  data,
-		}
+	var p struct {
+		Apps []Application `json:"apps"`
 	}
-	return apps, nil
+	if err := json.Unmarshal(resp.Payload, &p); err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrInvalidResponse, err)
+	}
+	return p.Apps, nil
 }
 
-func (a *ApplicationControl) Launch(app Application, contentID string, params map[string]interface{}) error {
+func (a *ApplicationControl) Launch(ctx context.Context, appID string, contentID string, params map[string]interface{}) error {
 	payload := map[string]interface{}{
-		"id": app.ID,
+		"id": appID,
 	}
 	if contentID != "" {
 		payload["contentId"] = contentID
@@ -191,149 +183,169 @@ func (a *ApplicationControl) Launch(app Application, contentID string, params ma
 	if params != nil {
 		payload["params"] = params
 	}
-	_, err := a.Client.Request("ssap://system.launcher/launch", payload, 5*time.Second)
+	_, err := a.Client.Request(ctx, "ssap://system.launcher/launch", payload)
 	return err
 }
 
-func (a *ApplicationControl) GetCurrent() (string, error) {
-	resp, err := a.Client.Request("ssap://com.webos.applicationManager/getForegroundAppInfo", nil, 5*time.Second)
+func (a *ApplicationControl) GetForegroundApp(ctx context.Context) (string, error) {
+	resp, err := a.Client.Request(ctx, "ssap://com.webos.applicationManager/getForegroundAppInfo", nil)
 	if err != nil {
 		return "", err
 	}
-	p := resp.Payload.(map[string]interface{})
-	return p["appId"].(string), nil
+	var p struct {
+		AppID string `json:"appId"`
+	}
+	if err := json.Unmarshal(resp.Payload, &p); err != nil {
+		return "", fmt.Errorf("%w: %v", ErrInvalidResponse, err)
+	}
+	return p.AppID, nil
 }
 
-func (a *ApplicationControl) Close(launchInfo map[string]interface{}) error {
-	_, err := a.Client.Request("ssap://system.launcher/close", launchInfo, 5*time.Second)
+func (a *ApplicationControl) Close(ctx context.Context, appID string) error {
+	payload := map[string]interface{}{"id": appID}
+	_, err := a.Client.Request(ctx, "ssap://system.launcher/close", payload)
 	return err
 }
 
-// TvControl
+// TvControl provides methods for TV channel management.
 type TvControl struct {
 	Control
 }
 
-func (t *TvControl) ChannelUp() error {
-	_, err := t.Client.Request("ssap://tv/channelUp", nil, 5*time.Second)
+func (t *TvControl) ChannelUp(ctx context.Context) error {
+	_, err := t.Client.Request(ctx, "ssap://tv/channelUp", nil)
 	return err
 }
 
-func (t *TvControl) ChannelDown() error {
-	_, err := t.Client.Request("ssap://tv/channelDown", nil, 5*time.Second)
+func (t *TvControl) ChannelDown(ctx context.Context) error {
+	_, err := t.Client.Request(ctx, "ssap://tv/channelDown", nil)
 	return err
 }
 
-func (t *TvControl) GetCurrentChannel() (map[string]interface{}, error) {
-	resp, err := t.Client.Request("ssap://tv/getCurrentChannel", nil, 5*time.Second)
+func (t *TvControl) GetCurrentChannel(ctx context.Context) (*ChannelInfo, error) {
+	resp, err := t.Client.Request(ctx, "ssap://tv/getCurrentChannel", nil)
 	if err != nil {
 		return nil, err
 	}
-	return resp.Payload.(map[string]interface{}), nil
+	var info ChannelInfo
+	if err := json.Unmarshal(resp.Payload, &info); err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrInvalidResponse, err)
+	}
+	return &info, nil
 }
 
-func (t *TvControl) ChannelList() (map[string]interface{}, error) {
-	resp, err := t.Client.Request("ssap://tv/getChannelList", nil, 5*time.Second)
+func (t *TvControl) ChannelList(ctx context.Context) ([]ChannelInfo, error) {
+	resp, err := t.Client.Request(ctx, "ssap://tv/getChannelList", nil)
 	if err != nil {
 		return nil, err
 	}
-	return resp.Payload.(map[string]interface{}), nil
+	var p struct {
+		ChannelList []ChannelInfo `json:"channelList"`
+	}
+	if err := json.Unmarshal(resp.Payload, &p); err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrInvalidResponse, err)
+	}
+	return p.ChannelList, nil
 }
 
-func (t *TvControl) SetChannelWithID(channelID string) error {
+func (t *TvControl) SetChannel(ctx context.Context, channelID string) error {
 	payload := map[string]interface{}{"channelId": channelID}
-	_, err := t.Client.Request("ssap://tv/openChannel", payload, 5*time.Second)
+	_, err := t.Client.Request(ctx, "ssap://tv/openChannel", payload)
 	return err
 }
 
-func (t *TvControl) GetCurrentProgram() (map[string]interface{}, error) {
-	resp, err := t.Client.Request("ssap://tv/getChannelProgramInfo", nil, 5*time.Second)
-	if err != nil {
-		return nil, err
-	}
-	return resp.Payload.(map[string]interface{}), nil
-}
-
-// SourceControl
+// SourceControl provides methods to manage input sources.
 type SourceControl struct {
 	Control
 }
 
-func (s *SourceControl) ListSources() ([]InputSource, error) {
-	resp, err := s.Client.Request("ssap://tv/getExternalInputList", nil, 5*time.Second)
+func (s *SourceControl) ListSources(ctx context.Context) ([]InputSource, error) {
+	resp, err := s.Client.Request(ctx, "ssap://tv/getExternalInputList", nil)
 	if err != nil {
 		return nil, err
 	}
-	p := resp.Payload.(map[string]interface{})
-	sourcesData := p["devices"].([]interface{})
-	sources := make([]InputSource, len(sourcesData))
-	for i, v := range sourcesData {
-		data := v.(map[string]interface{})
-		sources[i] = InputSource{
-			ID:    data["id"].(string),
-			Label: data["label"].(string),
-			Data:  data,
-		}
+	var p struct {
+		Devices []InputSource `json:"devices"`
 	}
-	return sources, nil
+	if err := json.Unmarshal(resp.Payload, &p); err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrInvalidResponse, err)
+	}
+	return p.Devices, nil
 }
 
-func (s *SourceControl) SetSource(source InputSource) error {
-	payload := map[string]interface{}{"inputId": source.ID}
-	_, err := s.Client.Request("ssap://tv/switchInput", payload, 5*time.Second)
+func (s *SourceControl) SetSource(ctx context.Context, sourceID string) error {
+	payload := map[string]interface{}{"inputId": sourceID}
+	_, err := s.Client.Request(ctx, "ssap://tv/switchInput", payload)
 	return err
 }
 
-// InputControl
+// InputControl provides methods for mouse and keyboard input.
 type InputControl struct {
 	Control
-	mouseConn *websocket.Conn
+	mouseConn   *websocket.Conn
+	mouseConnMu sync.Mutex
 }
 
-func (i *InputControl) Type(text string) error {
+func (i *InputControl) Type(ctx context.Context, text string) error {
 	payload := map[string]interface{}{"text": text, "replace": 0}
-	_, err := i.Client.Request("ssap://com.webos.service.ime/insertText", payload, 5*time.Second)
+	_, err := i.Client.Request(ctx, "ssap://com.webos.service.ime/insertText", payload)
 	return err
 }
 
-func (i *InputControl) Delete(count int) error {
+func (i *InputControl) Delete(ctx context.Context, count int) error {
 	payload := map[string]interface{}{"count": count}
-	_, err := i.Client.Request("ssap://com.webos.service.ime/deleteCharacters", payload, 5*time.Second)
+	_, err := i.Client.Request(ctx, "ssap://com.webos.service.ime/deleteCharacters", payload)
 	return err
 }
 
-func (i *InputControl) Enter() error {
-	_, err := i.Client.Request("ssap://com.webos.service.ime/sendEnterKey", nil, 5*time.Second)
+func (i *InputControl) Enter(ctx context.Context) error {
+	_, err := i.Client.Request(ctx, "ssap://com.webos.service.ime/sendEnterKey", nil)
 	return err
 }
 
-func (i *InputControl) ConnectInput() error {
-	resp, err := i.Client.Request("ssap://com.webos.service.networkinput/getPointerInputSocket", nil, 5*time.Second)
+func (i *InputControl) ConnectInput(ctx context.Context) error {
+	i.mouseConnMu.Lock()
+	defer i.mouseConnMu.Unlock()
+
+	resp, err := i.Client.Request(ctx, "ssap://com.webos.service.networkinput/getPointerInputSocket", nil)
 	if err != nil {
 		return err
 	}
-	p := resp.Payload.(map[string]interface{})
-	sockPath := p["socketPath"].(string)
-	if sockPath == "" {
-		return errors.New("unable to connect to mouse")
+	var p struct {
+		SocketPath string `json:"socketPath"`
+	}
+	if err := json.Unmarshal(resp.Payload, &p); err != nil {
+		return fmt.Errorf("%w: %v", ErrInvalidResponse, err)
 	}
 
-	conn, _, err := websocket.DefaultDialer.Dial(sockPath, nil)
+	if p.SocketPath == "" {
+		return errors.New("unable to connect to mouse: empty socket path")
+	}
+
+	conn, _, err := websocket.DefaultDialer.DialContext(ctx, p.SocketPath, nil)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to dial mouse socket: %w", err)
 	}
 	i.mouseConn = conn
 	return nil
 }
 
 func (i *InputControl) DisconnectInput() error {
+	i.mouseConnMu.Lock()
+	defer i.mouseConnMu.Unlock()
+
 	if i.mouseConn != nil {
-		return i.mouseConn.Close()
+		err := i.mouseConn.Close()
+		i.mouseConn = nil
+		return err
 	}
 	return nil
 }
 
 func (i *InputControl) sendMouseCommand(cmd string, params ...interface{}) error {
+	i.mouseConnMu.Lock()
+	defer i.mouseConnMu.Unlock()
+
 	if i.mouseConn == nil {
 		return errors.New("mouse not connected")
 	}
@@ -362,28 +374,28 @@ func (i *InputControl) Button(name string) error {
 }
 
 // Specific buttons
-func (i *InputControl) Left() error  { return i.Button("LEFT") }
-func (i *InputControl) Right() error { return i.Button("RIGHT") }
-func (i *InputControl) Up() error    { return i.Button("UP") }
-func (i *InputControl) Down() error  { return i.Button("DOWN") }
-func (i *InputControl) Home() error  { return i.Button("HOME") }
-func (i *InputControl) Back() error  { return i.Button("BACK") }
-func (i *InputControl) Menu() error  { return i.Button("MENU") }
-func (i *InputControl) OK() error    { return i.Button("ENTER") }
-func (i *InputControl) Dash() error  { return i.Button("DASH") }
-func (i *InputControl) Info() error  { return i.Button("INFO") }
-func (i *InputControl) Exit() error  { return i.Button("EXIT") }
-func (i *InputControl) Mute() error  { return i.Button("MUTE") }
-func (i *InputControl) Red() error   { return i.Button("RED") }
-func (i *InputControl) Green() error { return i.Button("GREEN") }
-func (i *InputControl) Yellow() error { return i.Button("YELLOW") }
-func (i *InputControl) Blue() error  { return i.Button("BLUE") }
-func (i *InputControl) VolumeUp() error { return i.Button("VOLUMEUP") }
-func (i *InputControl) VolumeDown() error { return i.Button("VOLUMEDOWN") }
-func (i *InputControl) ChannelUp() error { return i.Button("CHANNELUP") }
-func (i *InputControl) ChannelDown() error { return i.Button("CHANNELDOWN") }
-func (i *InputControl) Play() error { return i.Button("PLAY") }
-func (i *InputControl) Pause() error { return i.Button("PAUSE") }
-func (i *InputControl) Stop() error { return i.Button("STOP") }
-func (i *InputControl) Rewind() error { return i.Button("REWIND") }
-func (i *InputControl) FastForward() error { return i.Button("FASTFORWARD") }
+func (i *InputControl) Left() error         { return i.Button("LEFT") }
+func (i *InputControl) Right() error        { return i.Button("RIGHT") }
+func (i *InputControl) Up() error           { return i.Button("UP") }
+func (i *InputControl) Down() error         { return i.Button("DOWN") }
+func (i *InputControl) Home() error         { return i.Button("HOME") }
+func (i *InputControl) Back() error         { return i.Button("BACK") }
+func (i *InputControl) Menu() error         { return i.Button("MENU") }
+func (i *InputControl) OK() error           { return i.Button("ENTER") }
+func (i *InputControl) Dash() error         { return i.Button("DASH") }
+func (i *InputControl) Info() error         { return i.Button("INFO") }
+func (i *InputControl) Exit() error         { return i.Button("EXIT") }
+func (i *InputControl) Mute() error         { return i.Button("MUTE") }
+func (i *InputControl) Red() error          { return i.Button("RED") }
+func (i *InputControl) Green() error        { return i.Button("GREEN") }
+func (i *InputControl) Yellow() error       { return i.Button("YELLOW") }
+func (i *InputControl) Blue() error         { return i.Button("BLUE") }
+func (i *InputControl) VolumeUp() error     { return i.Button("VOLUMEUP") }
+func (i *InputControl) VolumeDown() error   { return i.Button("VOLUMEDOWN") }
+func (i *InputControl) ChannelUp() error    { return i.Button("CHANNELUP") }
+func (i *InputControl) ChannelDown() error  { return i.Button("CHANNELDOWN") }
+func (i *InputControl) Play() error         { return i.Button("PLAY") }
+func (i *InputControl) Pause() error        { return i.Button("PAUSE") }
+func (i *InputControl) Stop() error         { return i.Button("STOP") }
+func (i *InputControl) Rewind() error       { return i.Button("REWIND") }
+func (i *InputControl) FastForward() error  { return i.Button("FASTFORWARD") }
