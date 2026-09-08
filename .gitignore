@@ -18,6 +18,10 @@ ref/
 example/example
 go_webostv
 
+# Agent skills
+/.agents/
+/skills-lock.json
+
 # IDEs
 .idea/
 .vscode/

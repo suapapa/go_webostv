@@ -14,13 +14,14 @@ import (
 
 const (
 	// SSDPService is the SSDP service type for WebOS TVs.
-	SSDPService = "urn:schemas-upnp-org:device:MediaRenderer:1"
+	SSDPService              = "urn:schemas-upnp-org:device:MediaRenderer:1"
+	maxDeviceDescriptionSize = 1 << 20
 )
 
 // DiscoverOptions contains options for TV discovery.
 type DiscoverOptions struct {
-	Secure           bool
-	SearchWait       int
+	Secure            bool
+	SearchWait        int
 	ValidationTimeout time.Duration
 }
 
@@ -44,8 +45,8 @@ func WithSearchWait(wait int) DiscoverOption {
 // Discover searches for WebOS TVs on the network.
 func Discover(ctx context.Context, opts ...DiscoverOption) ([]*Client, error) {
 	options := DiscoverOptions{
-		Secure:           false,
-		SearchWait:       3,
+		Secure:            false,
+		SearchWait:        3,
 		ValidationTimeout: 5 * time.Second,
 	}
 	for _, opt := range opts {
@@ -57,18 +58,23 @@ func Discover(ctx context.Context, opts ...DiscoverOption) ([]*Client, error) {
 		return nil, fmt.Errorf("ssdp search failed: %w", err)
 	}
 
-	locations := make(map[string]bool)
+	locations := map[string]bool{}
 	for _, res := range list {
 		if res.Location == "" || locations[res.Location] {
 			continue
 		}
 
-		if validateLocation(ctx, res.Location, "LG", options.ValidationTimeout) {
+		if validateLocation(
+			ctx,
+			res.Location,
+			"LG",
+			options.ValidationTimeout,
+		) {
 			locations[res.Location] = true
 		}
 	}
 
-	var clients []*Client
+	clients := make([]*Client, 0, len(locations))
 	for loc := range locations {
 		u, err := url.Parse(loc)
 		if err != nil {
@@ -84,7 +90,12 @@ func validateLocation(ctx context.Context, location, keyword string, timeout tim
 	vCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	req, err := http.NewRequestWithContext(vCtx, http.MethodGet, location, nil)
+	req, err := http.NewRequestWithContext(
+		vCtx,
+		http.MethodGet,
+		location,
+		nil,
+	)
 	if err != nil {
 		return false
 	}
@@ -94,13 +105,13 @@ func validateLocation(ctx context.Context, location, keyword string, timeout tim
 	if err != nil {
 		return false
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
 		return false
 	}
 
-	body, err := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxDeviceDescriptionSize))
 	if err != nil {
 		return false
 	}

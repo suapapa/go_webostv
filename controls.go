@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/gorilla/websocket"
 )
@@ -39,7 +40,7 @@ func (m *MediaControl) GetVolume(ctx context.Context) (*VolumeInfo, error) {
 	}
 	var info VolumeInfo
 	if err := json.Unmarshal(resp.Payload, &info); err != nil {
-		return nil, fmt.Errorf("%w: %v", ErrInvalidResponse, err)
+		return nil, fmt.Errorf("%w: %w", ErrInvalidResponse, err)
 	}
 	return &info, nil
 }
@@ -88,7 +89,7 @@ func (m *MediaControl) GetAudioOutput(ctx context.Context) (*AudioOutputSource, 
 	}
 	var out AudioOutputSource
 	if err := json.Unmarshal(resp.Payload, &out); err != nil {
-		return nil, fmt.Errorf("%w: %v", ErrInvalidResponse, err)
+		return nil, fmt.Errorf("%w: %w", ErrInvalidResponse, err)
 	}
 	return &out, nil
 }
@@ -100,6 +101,10 @@ func (m *MediaControl) SetAudioOutput(ctx context.Context, output string) error 
 }
 
 func (m *MediaControl) SubscribeVolume(callback func(*VolumeInfo)) (string, error) {
+	if callback == nil {
+		return "", errors.New("volume subscription callback must not be nil")
+	}
+
 	return m.Client.Subscribe("ssap://audio/getVolume", func(p json.RawMessage) {
 		var info VolumeInfo
 		if err := json.Unmarshal(p, &info); err == nil {
@@ -137,7 +142,7 @@ func (s *SystemControl) Info(ctx context.Context) (*SWInformation, error) {
 	}
 	var info SWInformation
 	if err := json.Unmarshal(resp.Payload, &info); err != nil {
-		return nil, fmt.Errorf("%w: %v", ErrInvalidResponse, err)
+		return nil, fmt.Errorf("%w: %w", ErrInvalidResponse, err)
 	}
 	return &info, nil
 }
@@ -164,16 +169,23 @@ func (a *ApplicationControl) ListApps(ctx context.Context) ([]Application, error
 	if err != nil {
 		return nil, err
 	}
-	var p struct {
+	p := struct {
 		Apps []Application `json:"apps"`
+	}{
+		Apps: []Application{},
 	}
 	if err := json.Unmarshal(resp.Payload, &p); err != nil {
-		return nil, fmt.Errorf("%w: %v", ErrInvalidResponse, err)
+		return nil, fmt.Errorf("%w: %w", ErrInvalidResponse, err)
 	}
 	return p.Apps, nil
 }
 
-func (a *ApplicationControl) Launch(ctx context.Context, appID string, contentID string, params map[string]interface{}) error {
+func (a *ApplicationControl) Launch(
+	ctx context.Context,
+	appID string,
+	contentID string,
+	params map[string]interface{},
+) error {
 	payload := map[string]interface{}{
 		"id": appID,
 	}
@@ -196,7 +208,7 @@ func (a *ApplicationControl) GetForegroundApp(ctx context.Context) (string, erro
 		AppID string `json:"appId"`
 	}
 	if err := json.Unmarshal(resp.Payload, &p); err != nil {
-		return "", fmt.Errorf("%w: %v", ErrInvalidResponse, err)
+		return "", fmt.Errorf("%w: %w", ErrInvalidResponse, err)
 	}
 	return p.AppID, nil
 }
@@ -229,7 +241,7 @@ func (t *TvControl) GetCurrentChannel(ctx context.Context) (*ChannelInfo, error)
 	}
 	var info ChannelInfo
 	if err := json.Unmarshal(resp.Payload, &info); err != nil {
-		return nil, fmt.Errorf("%w: %v", ErrInvalidResponse, err)
+		return nil, fmt.Errorf("%w: %w", ErrInvalidResponse, err)
 	}
 	return &info, nil
 }
@@ -239,11 +251,13 @@ func (t *TvControl) ChannelList(ctx context.Context) ([]ChannelInfo, error) {
 	if err != nil {
 		return nil, err
 	}
-	var p struct {
+	p := struct {
 		ChannelList []ChannelInfo `json:"channelList"`
+	}{
+		ChannelList: []ChannelInfo{},
 	}
 	if err := json.Unmarshal(resp.Payload, &p); err != nil {
-		return nil, fmt.Errorf("%w: %v", ErrInvalidResponse, err)
+		return nil, fmt.Errorf("%w: %w", ErrInvalidResponse, err)
 	}
 	return p.ChannelList, nil
 }
@@ -264,11 +278,13 @@ func (s *SourceControl) ListSources(ctx context.Context) ([]InputSource, error) 
 	if err != nil {
 		return nil, err
 	}
-	var p struct {
+	p := struct {
 		Devices []InputSource `json:"devices"`
+	}{
+		Devices: []InputSource{},
 	}
 	if err := json.Unmarshal(resp.Payload, &p); err != nil {
-		return nil, fmt.Errorf("%w: %v", ErrInvalidResponse, err)
+		return nil, fmt.Errorf("%w: %w", ErrInvalidResponse, err)
 	}
 	return p.Devices, nil
 }
@@ -306,6 +322,9 @@ func (i *InputControl) Enter(ctx context.Context) error {
 func (i *InputControl) ConnectInput(ctx context.Context) error {
 	i.mouseConnMu.Lock()
 	defer i.mouseConnMu.Unlock()
+	if i.mouseConn != nil {
+		return nil
+	}
 
 	resp, err := i.Client.Request(ctx, "ssap://com.webos.service.networkinput/getPointerInputSocket", nil)
 	if err != nil {
@@ -315,7 +334,7 @@ func (i *InputControl) ConnectInput(ctx context.Context) error {
 		SocketPath string `json:"socketPath"`
 	}
 	if err := json.Unmarshal(resp.Payload, &p); err != nil {
-		return fmt.Errorf("%w: %v", ErrInvalidResponse, err)
+		return fmt.Errorf("%w: %w", ErrInvalidResponse, err)
 	}
 
 	if p.SocketPath == "" {
@@ -349,16 +368,36 @@ func (i *InputControl) sendMouseCommand(cmd string, params ...interface{}) error
 	if i.mouseConn == nil {
 		return errors.New("mouse not connected")
 	}
+	if len(params)%2 != 0 {
+		return errors.New("mouse command parameters must be key-value pairs")
+	}
+
 	parts := []string{"type:" + cmd}
 	for j := 0; j < len(params); j += 2 {
-		parts = append(parts, fmt.Sprintf("%v:%v", params[j], params[j+1]))
+		key := fmt.Sprint(params[j])
+		value := fmt.Sprint(params[j+1])
+		if strings.ContainsAny(key+value, "\r\n") {
+			return errors.New("mouse command parameters must not contain newlines")
+		}
+		parts = append(parts, key+":"+value)
 	}
 	payload := strings.Join(parts, "\n") + "\n\n"
+	if err := i.mouseConn.SetWriteDeadline(time.Now().Add(DefaultWriteWait)); err != nil {
+		return fmt.Errorf("failed to set mouse write deadline: %w", err)
+	}
 	return i.mouseConn.WriteMessage(websocket.TextMessage, []byte(payload))
 }
 
 func (i *InputControl) Move(dx, dy int, drag int) error {
-	return i.sendMouseCommand("move", "dx", dx, "dy", dy, "down", drag)
+	return i.sendMouseCommand(
+		"move",
+		"dx",
+		dx,
+		"dy",
+		dy,
+		"down",
+		drag,
+	)
 }
 
 func (i *InputControl) Click() error {
@@ -366,36 +405,41 @@ func (i *InputControl) Click() error {
 }
 
 func (i *InputControl) Scroll(dx, dy int) error {
-	return i.sendMouseCommand("scroll", "dx", dx, "dy", dy)
+	return i.sendMouseCommand(
+		"scroll",
+		"dx",
+		dx,
+		"dy",
+		dy,
+	)
 }
 
 func (i *InputControl) Button(name string) error {
 	return i.sendMouseCommand("button", "name", name)
 }
 
-// Specific buttons
-func (i *InputControl) Left() error         { return i.Button("LEFT") }
-func (i *InputControl) Right() error        { return i.Button("RIGHT") }
-func (i *InputControl) Up() error           { return i.Button("UP") }
-func (i *InputControl) Down() error         { return i.Button("DOWN") }
-func (i *InputControl) Home() error         { return i.Button("HOME") }
-func (i *InputControl) Back() error         { return i.Button("BACK") }
-func (i *InputControl) Menu() error         { return i.Button("MENU") }
-func (i *InputControl) OK() error           { return i.Button("ENTER") }
-func (i *InputControl) Dash() error         { return i.Button("DASH") }
-func (i *InputControl) Info() error         { return i.Button("INFO") }
-func (i *InputControl) Exit() error         { return i.Button("EXIT") }
-func (i *InputControl) Mute() error         { return i.Button("MUTE") }
-func (i *InputControl) Red() error          { return i.Button("RED") }
-func (i *InputControl) Green() error        { return i.Button("GREEN") }
-func (i *InputControl) Yellow() error       { return i.Button("YELLOW") }
-func (i *InputControl) Blue() error         { return i.Button("BLUE") }
-func (i *InputControl) VolumeUp() error     { return i.Button("VOLUMEUP") }
-func (i *InputControl) VolumeDown() error   { return i.Button("VOLUMEDOWN") }
-func (i *InputControl) ChannelUp() error    { return i.Button("CHANNELUP") }
-func (i *InputControl) ChannelDown() error  { return i.Button("CHANNELDOWN") }
-func (i *InputControl) Play() error         { return i.Button("PLAY") }
-func (i *InputControl) Pause() error        { return i.Button("PAUSE") }
-func (i *InputControl) Stop() error         { return i.Button("STOP") }
-func (i *InputControl) Rewind() error       { return i.Button("REWIND") }
-func (i *InputControl) FastForward() error  { return i.Button("FASTFORWARD") }
+func (i *InputControl) Left() error        { return i.Button("LEFT") }
+func (i *InputControl) Right() error       { return i.Button("RIGHT") }
+func (i *InputControl) Up() error          { return i.Button("UP") }
+func (i *InputControl) Down() error        { return i.Button("DOWN") }
+func (i *InputControl) Home() error        { return i.Button("HOME") }
+func (i *InputControl) Back() error        { return i.Button("BACK") }
+func (i *InputControl) Menu() error        { return i.Button("MENU") }
+func (i *InputControl) OK() error          { return i.Button("ENTER") }
+func (i *InputControl) Dash() error        { return i.Button("DASH") }
+func (i *InputControl) Info() error        { return i.Button("INFO") }
+func (i *InputControl) Exit() error        { return i.Button("EXIT") }
+func (i *InputControl) Mute() error        { return i.Button("MUTE") }
+func (i *InputControl) Red() error         { return i.Button("RED") }
+func (i *InputControl) Green() error       { return i.Button("GREEN") }
+func (i *InputControl) Yellow() error      { return i.Button("YELLOW") }
+func (i *InputControl) Blue() error        { return i.Button("BLUE") }
+func (i *InputControl) VolumeUp() error    { return i.Button("VOLUMEUP") }
+func (i *InputControl) VolumeDown() error  { return i.Button("VOLUMEDOWN") }
+func (i *InputControl) ChannelUp() error   { return i.Button("CHANNELUP") }
+func (i *InputControl) ChannelDown() error { return i.Button("CHANNELDOWN") }
+func (i *InputControl) Play() error        { return i.Button("PLAY") }
+func (i *InputControl) Pause() error       { return i.Button("PAUSE") }
+func (i *InputControl) Stop() error        { return i.Button("STOP") }
+func (i *InputControl) Rewind() error      { return i.Button("REWIND") }
+func (i *InputControl) FastForward() error { return i.Button("FASTFORWARD") }

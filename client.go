@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
+	"net/netip"
 	"strings"
 	"sync"
 	"time"
@@ -44,17 +46,17 @@ type Message struct {
 
 // Client is a WebOS TV client.
 type Client struct {
-	url string
-	ctx context.Context
+	url    string
+	ctx    context.Context
 	cancel context.CancelFunc
 
-	conn *websocket.Conn
+	conn   *websocket.Conn
 	connMu sync.Mutex
 
-	waiters    map[string]chan *Message
-	waiterMu   sync.RWMutex
+	waiters  map[string]chan *Message
+	waiterMu sync.RWMutex
 
-	subscribers map[string]subscription
+	subscribers  map[string]subscription
 	subscriberMu sync.RWMutex
 
 	writeMu sync.Mutex
@@ -99,20 +101,14 @@ func NewClient(host string, opts ...Option) *Client {
 		opt(&options)
 	}
 
-	var wsURL string
+	scheme := "ws"
+	port := "3000"
 	if options.secure {
-		if strings.Contains(host, ":") {
-			wsURL = fmt.Sprintf("wss://%s/", host)
-		} else {
-			wsURL = fmt.Sprintf("wss://%s:3001/", host)
-		}
-	} else {
-		if strings.Contains(host, ":") {
-			wsURL = fmt.Sprintf("ws://%s/", host)
-		} else {
-			wsURL = fmt.Sprintf("ws://%s:3000/", host)
-		}
+		scheme = "wss"
+		port = "3001"
 	}
+
+	wsURL := scheme + "://" + address(host, port) + "/"
 
 	ctx, cancel := context.WithCancel(context.Background())
 
@@ -135,7 +131,13 @@ func (c *Client) Connect() error {
 		return nil
 	}
 
-	dialer := websocket.DefaultDialer
+	select {
+	case <-c.ctx.Done():
+		return ErrConnectionClosed
+	default:
+	}
+
+	dialer := *websocket.DefaultDialer
 	dialer.HandshakeTimeout = c.options.handshakeTimeout
 
 	conn, _, err := dialer.Dial(c.url, nil)
@@ -144,7 +146,7 @@ func (c *Client) Connect() error {
 	}
 	c.conn = conn
 
-	go c.readLoop()
+	go c.readLoop(conn)
 
 	return nil
 }
@@ -152,15 +154,17 @@ func (c *Client) Connect() error {
 // Close closes the connection to the TV.
 func (c *Client) Close() error {
 	c.cancel()
-	c.connMu.Lock()
-	defer c.connMu.Unlock()
 
-	if c.conn != nil {
-		err := c.conn.Close()
-		c.conn = nil
-		return err
+	c.connMu.Lock()
+	conn := c.conn
+	c.conn = nil
+	c.connMu.Unlock()
+
+	if conn == nil {
+		return nil
 	}
-	return nil
+
+	return conn.Close()
 }
 
 // URL returns the URL the client is connected to.
@@ -168,15 +172,24 @@ func (c *Client) URL() string {
 	return c.url
 }
 
-func (c *Client) readLoop() {
+func (c *Client) readLoop(conn *websocket.Conn) {
 	defer func() {
+		c.cancel()
+
+		c.connMu.Lock()
+		if c.conn == conn {
+			c.conn = nil
+		}
+		c.connMu.Unlock()
+
 		c.waiterMu.Lock()
 		for id, ch := range c.waiters {
 			close(ch)
 			delete(c.waiters, id)
 		}
 		c.waiterMu.Unlock()
-		_ = c.Close()
+
+		_ = conn.Close()
 	}()
 
 	for {
@@ -184,7 +197,7 @@ func (c *Client) readLoop() {
 		case <-c.ctx.Done():
 			return
 		default:
-			_, data, err := c.conn.ReadMessage()
+			_, data, err := conn.ReadMessage()
 			if err != nil {
 				return
 			}
@@ -202,17 +215,17 @@ func (c *Client) readLoop() {
 func (c *Client) handleMessage(msg *Message) {
 	c.waiterMu.RLock()
 	ch, ok := c.waiters[msg.ID]
-	c.waiterMu.RUnlock()
-
 	if ok {
 		select {
 		case ch <- msg:
 		case <-c.ctx.Done():
 		default:
-			// channel full, drop message or handle overflow
+			// An abandoned waiter must not block all incoming messages.
 		}
+		c.waiterMu.RUnlock()
 		return
 	}
+	c.waiterMu.RUnlock()
 
 	c.subscriberMu.RLock()
 	sub, ok := c.subscribers[msg.ID]
@@ -227,6 +240,12 @@ func (c *Client) handleMessage(msg *Message) {
 func (c *Client) Register(ctx context.Context, store map[string]string) (<-chan RegistrationStatus, <-chan error) {
 	statusChan := make(chan RegistrationStatus)
 	errChan := make(chan error, 1)
+	if store == nil {
+		close(statusChan)
+		errChan <- errors.New("registration store must not be nil")
+		close(errChan)
+		return statusChan, errChan
+	}
 
 	payload := make(map[string]interface{})
 	for k, v := range RegistrationPayload {
@@ -241,11 +260,22 @@ func (c *Client) Register(ctx context.Context, store map[string]string) (<-chan 
 		defer close(statusChan)
 		defer close(errChan)
 
-		respChan, _, err := c.SendMessage(ctx, "", "register", "", payload)
+		respChan, id, err := c.SendMessage(
+			ctx,
+			"",
+			"register",
+			"",
+			payload,
+		)
 		if err != nil {
 			errChan <- fmt.Errorf("failed to send registration message: %w", err)
 			return
 		}
+		defer func() {
+			c.waiterMu.Lock()
+			delete(c.waiters, id)
+			c.waiterMu.Unlock()
+		}()
 
 		for {
 			select {
@@ -271,20 +301,23 @@ func (c *Client) Register(ctx context.Context, store map[string]string) (<-chan 
 					return
 				}
 
-				if p.PairingType == "PROMPT" {
+				switch {
+				case p.PairingType == "PROMPT":
 					select {
 					case statusChan <- Prompted:
 					case <-ctx.Done():
+						errChan <- ctx.Err()
 						return
 					}
-				} else if item.Type == "registered" {
+				case item.Type == "registered":
 					store["client_key"] = p.ClientKey
 					select {
 					case statusChan <- Registered:
 					case <-ctx.Done():
+						errChan <- ctx.Err()
 					}
 					return
-				} else if item.Type == "error" {
+				case item.Type == "error":
 					errChan <- fmt.Errorf("registration error: %s", p.Error)
 					return
 				}
@@ -297,7 +330,13 @@ func (c *Client) Register(ctx context.Context, store map[string]string) (<-chan 
 
 // Request sends a request and waits for a single response.
 func (c *Client) Request(ctx context.Context, uri string, payload interface{}) (*Message, error) {
-	respChan, id, err := c.SendMessage(ctx, "", "request", uri, payload)
+	respChan, id, err := c.SendMessage(
+		ctx,
+		"",
+		"request",
+		uri,
+		payload,
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -324,11 +363,18 @@ func (c *Client) Request(ctx context.Context, uri string, payload interface{}) (
 }
 
 // SendMessage sends a message to the TV. If id is empty, a new UUID is generated.
-func (c *Client) SendMessage(ctx context.Context, id, requestType, uri string, payload interface{}) (<-chan *Message, string, error) {
+// Its protocol fields remain separate to preserve the public API.
+func (c *Client) SendMessage(
+	ctx context.Context,
+	id string,
+	requestType string,
+	uri string,
+	payload interface{},
+) (<-chan *Message, string, error) {
 	if id == "" {
 		id = uuid.New().String()
 	}
-	
+
 	rawPayload, err := json.Marshal(payload)
 	if err != nil {
 		return nil, "", fmt.Errorf("failed to marshal payload: %w", err)
@@ -345,18 +391,18 @@ func (c *Client) SendMessage(ctx context.Context, id, requestType, uri string, p
 
 	ch := make(chan *Message, 10)
 	c.waiterMu.Lock()
+	if _, exists := c.waiters[id]; exists {
+		c.waiterMu.Unlock()
+		return nil, "", fmt.Errorf("request ID %q is already in use", id)
+	}
 	c.waiters[id] = ch
 	c.waiterMu.Unlock()
 
-	c.writeMu.Lock()
-	err = c.conn.WriteJSON(msg)
-	c.writeMu.Unlock()
-
-	if err != nil {
+	if err := c.writeMessage(ctx, msg); err != nil {
 		c.waiterMu.Lock()
 		delete(c.waiters, id)
 		c.waiterMu.Unlock()
-		return nil, "", fmt.Errorf("failed to write JSON: %w", err)
+		return nil, "", err
 	}
 
 	return ch, id, nil
@@ -364,6 +410,10 @@ func (c *Client) SendMessage(ctx context.Context, id, requestType, uri string, p
 
 // Subscribe subscribes to a URI.
 func (c *Client) Subscribe(uri string, callback func(json.RawMessage)) (string, error) {
+	if callback == nil {
+		return "", errors.New("subscription callback must not be nil")
+	}
+
 	id := uuid.New().String()
 
 	c.subscriberMu.Lock()
@@ -373,19 +423,18 @@ func (c *Client) Subscribe(uri string, callback func(json.RawMessage)) (string, 
 	}
 	c.subscriberMu.Unlock()
 
-	_, _, err := c.SendMessage(context.Background(), id, "subscribe", uri, nil)
-	if err != nil {
+	msg := Message{
+		Type:    "subscribe",
+		ID:      id,
+		URI:     uri,
+		Payload: json.RawMessage("null"),
+	}
+	if err := c.writeMessage(context.Background(), msg); err != nil {
 		c.subscriberMu.Lock()
 		delete(c.subscribers, id)
 		c.subscriberMu.Unlock()
 		return "", fmt.Errorf("failed to send subscribe message: %w", err)
 	}
-
-	// For subscriptions, we don't want to use the waiter mechanism after the initial send,
-	// because we want all responses (including the first one) to go to the subscriber callback.
-	c.waiterMu.Lock()
-	delete(c.waiters, id)
-	c.waiterMu.Unlock()
 
 	return id, nil
 }
@@ -403,9 +452,61 @@ func (c *Client) Unsubscribe(id string) error {
 		return errors.New("subscription not found")
 	}
 
-	_, _, err := c.SendMessage(context.Background(), "", "unsubscribe", sub.uri, nil)
-	if err != nil {
+	msg := Message{
+		Type:    "unsubscribe",
+		ID:      uuid.New().String(),
+		URI:     sub.uri,
+		Payload: json.RawMessage("null"),
+	}
+	if err := c.writeMessage(context.Background(), msg); err != nil {
 		return fmt.Errorf("failed to send unsubscribe message: %w", err)
 	}
 	return nil
+}
+
+func (c *Client) writeMessage(ctx context.Context, msg Message) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-c.ctx.Done():
+		return ErrConnectionClosed
+	default:
+	}
+
+	c.connMu.Lock()
+	conn := c.conn
+	c.connMu.Unlock()
+	if conn == nil {
+		return ErrConnectionClosed
+	}
+
+	deadline := time.Now().Add(DefaultWriteWait)
+	if ctxDeadline, ok := ctx.Deadline(); ok && ctxDeadline.Before(deadline) {
+		deadline = ctxDeadline
+	}
+
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+
+	if err := conn.SetWriteDeadline(deadline); err != nil {
+		return fmt.Errorf("failed to set write deadline: %w", err)
+	}
+	if err := conn.WriteJSON(msg); err != nil {
+		return fmt.Errorf("failed to write JSON: %w", err)
+	}
+
+	return nil
+}
+
+func address(host, defaultPort string) string {
+	if _, _, err := net.SplitHostPort(host); err == nil {
+		return host
+	}
+
+	ip, err := netip.ParseAddr(strings.Trim(host, "[]"))
+	if err == nil {
+		return net.JoinHostPort(ip.String(), defaultPort)
+	}
+
+	return net.JoinHostPort(host, defaultPort)
 }

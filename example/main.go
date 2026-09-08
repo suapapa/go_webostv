@@ -32,7 +32,11 @@ func main() {
 	if err != nil {
 		log.Fatalf("connect error: %v", err)
 	}
-	defer client.Close()
+	defer func() {
+		if err := client.Close(); err != nil {
+			log.Printf("close error: %v", err)
+		}
+	}()
 
 	// Registration
 	store := make(map[string]string)
@@ -58,7 +62,7 @@ func main() {
 
 	// Use controls
 	media := &webostv.MediaControl{Control: webostv.Control{Client: client}}
-	
+
 	// New API: methods take context
 	vol, err := media.GetVolume(ctx)
 	if err == nil {
