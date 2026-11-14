@@ -53,6 +53,25 @@ func TestClient_ConnectDoesNotMutateDefaultDialer(t *testing.T) {
 	}
 }
 
+func TestClient_ConnectSecureSelfSigned(t *testing.T) {
+	s := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upgrader := websocket.Upgrader{}
+		_, _ = upgrader.Upgrade(w, r, nil)
+	}))
+	defer s.Close()
+
+	host := strings.TrimPrefix(s.URL, "https://")
+	client := NewClient(host, WithSecure(true))
+	if err := client.Connect(); err != nil {
+		t.Fatalf("failed to connect over wss: %v", err)
+	}
+	defer closeClient(t, client)
+
+	if websocket.DefaultDialer.TLSClientConfig != nil && websocket.DefaultDialer.TLSClientConfig.InsecureSkipVerify {
+		t.Fatal("Connect mutated websocket.DefaultDialer.TLSClientConfig")
+	}
+}
+
 func TestClient_SendMessageWithoutConnection(t *testing.T) {
 	client := NewClient("localhost")
 	_, _, err := client.SendMessage(

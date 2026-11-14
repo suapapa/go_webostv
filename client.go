@@ -2,6 +2,7 @@ package webostv
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -137,10 +138,7 @@ func (c *Client) Connect() error {
 	default:
 	}
 
-	dialer := *websocket.DefaultDialer
-	dialer.HandshakeTimeout = c.options.handshakeTimeout
-
-	conn, _, err := dialer.Dial(c.url, nil)
+	conn, _, err := c.dialer().Dial(c.url, nil)
 	if err != nil {
 		return fmt.Errorf("failed to dial %s: %w", c.url, err)
 	}
@@ -149,6 +147,22 @@ func (c *Client) Connect() error {
 	go c.readLoop(conn)
 
 	return nil
+}
+
+func (c *Client) dialer() *websocket.Dialer {
+	dialer := *websocket.DefaultDialer
+	dialer.HandshakeTimeout = c.options.handshakeTimeout
+	if c.options.secure {
+		var tlsCfg *tls.Config
+		if dialer.TLSClientConfig != nil {
+			tlsCfg = dialer.TLSClientConfig.Clone()
+		} else {
+			tlsCfg = &tls.Config{}
+		}
+		tlsCfg.InsecureSkipVerify = true
+		dialer.TLSClientConfig = tlsCfg
+	}
+	return &dialer
 }
 
 // Close closes the connection to the TV.

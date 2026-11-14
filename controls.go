@@ -341,7 +341,7 @@ func (i *InputControl) ConnectInput(ctx context.Context) error {
 		return errors.New("unable to connect to mouse: empty socket path")
 	}
 
-	conn, _, err := websocket.DefaultDialer.DialContext(ctx, p.SocketPath, nil)
+	conn, _, err := i.Client.dialer().DialContext(ctx, p.SocketPath, nil)
 	if err != nil {
 		return fmt.Errorf("failed to dial mouse socket: %w", err)
 	}
