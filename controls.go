@@ -320,11 +320,16 @@ func (i *InputControl) Enter(ctx context.Context) error {
 }
 
 func (i *InputControl) ConnectInput(ctx context.Context) error {
+	if i.Client == nil {
+		return errors.New("client must not be nil")
+	}
+
 	i.mouseConnMu.Lock()
-	defer i.mouseConnMu.Unlock()
 	if i.mouseConn != nil {
+		i.mouseConnMu.Unlock()
 		return nil
 	}
+	i.mouseConnMu.Unlock()
 
 	resp, err := i.Client.Request(ctx, "ssap://com.webos.service.networkinput/getPointerInputSocket", nil)
 	if err != nil {
@@ -341,22 +346,67 @@ func (i *InputControl) ConnectInput(ctx context.Context) error {
 		return errors.New("unable to connect to mouse: empty socket path")
 	}
 
-	conn, _, err := i.Client.dialer().DialContext(ctx, p.SocketPath, nil)
+	conn, _, err := i.Client.dialerForURL(p.SocketPath).DialContext(ctx, p.SocketPath, nil)
 	if err != nil {
 		return fmt.Errorf("failed to dial mouse socket: %w", err)
 	}
+
+	i.mouseConnMu.Lock()
+	if i.mouseConn != nil {
+		i.mouseConnMu.Unlock()
+		_ = conn.Close()
+		return nil
+	}
 	i.mouseConn = conn
+	i.mouseConnMu.Unlock()
+
+	go i.readMouseLoop(conn)
 	return nil
+}
+
+func (i *InputControl) readMouseLoop(conn *websocket.Conn) {
+	done := make(chan struct{})
+	defer close(done)
+	defer i.clearMouseConn(conn)
+
+	if i.Client != nil && i.Client.ctx != nil {
+		go func() {
+			select {
+			case <-i.Client.ctx.Done():
+				_ = conn.Close()
+			case <-done:
+			}
+		}()
+	}
+
+	for {
+		if _, _, err := conn.ReadMessage(); err != nil {
+			return
+		}
+	}
+}
+
+func (i *InputControl) clearMouseConn(conn *websocket.Conn) {
+	i.mouseConnMu.Lock()
+	i.clearMouseConnLocked(conn)
+	i.mouseConnMu.Unlock()
+}
+
+func (i *InputControl) clearMouseConnLocked(conn *websocket.Conn) {
+	if i.mouseConn == conn {
+		i.mouseConn = nil
+	}
+	_ = conn.Close()
 }
 
 func (i *InputControl) DisconnectInput() error {
 	i.mouseConnMu.Lock()
-	defer i.mouseConnMu.Unlock()
+	conn := i.mouseConn
+	i.mouseConn = nil
+	i.mouseConnMu.Unlock()
 
-	if i.mouseConn != nil {
-		err := i.mouseConn.Close()
-		i.mouseConn = nil
-		return err
+	if conn != nil {
+		return conn.Close()
 	}
 	return nil
 }
@@ -383,9 +433,14 @@ func (i *InputControl) sendMouseCommand(cmd string, params ...interface{}) error
 	}
 	payload := strings.Join(parts, "\n") + "\n\n"
 	if err := i.mouseConn.SetWriteDeadline(time.Now().Add(DefaultWriteWait)); err != nil {
+		i.clearMouseConnLocked(i.mouseConn)
 		return fmt.Errorf("failed to set mouse write deadline: %w", err)
 	}
-	return i.mouseConn.WriteMessage(websocket.TextMessage, []byte(payload))
+	if err := i.mouseConn.WriteMessage(websocket.TextMessage, []byte(payload)); err != nil {
+		i.clearMouseConnLocked(i.mouseConn)
+		return err
+	}
+	return nil
 }
 
 func (i *InputControl) Move(dx, dy int, drag int) error {

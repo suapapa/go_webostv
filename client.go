@@ -151,9 +151,13 @@ func (c *Client) Connect() error {
 }
 
 func (c *Client) dialer() *websocket.Dialer {
+	return c.dialerForURL(c.url)
+}
+
+func (c *Client) dialerForURL(rawURL string) *websocket.Dialer {
 	dialer := *websocket.DefaultDialer
 	dialer.HandshakeTimeout = c.options.handshakeTimeout
-	if c.options.secure {
+	if c.options.secure || strings.HasPrefix(rawURL, "wss://") {
 		var tlsCfg *tls.Config
 		if dialer.TLSClientConfig != nil {
 			tlsCfg = dialer.TLSClientConfig.Clone()
@@ -164,6 +168,23 @@ func (c *Client) dialer() *websocket.Dialer {
 		dialer.TLSClientConfig = tlsCfg
 	}
 	return &dialer
+}
+
+// IsConnected reports whether the client currently has an active connection.
+func (c *Client) IsConnected() bool {
+	if c == nil {
+		return false
+	}
+	select {
+	case <-c.ctx.Done():
+		return false
+	default:
+	}
+
+	c.connMu.Lock()
+	connected := c.conn != nil
+	c.connMu.Unlock()
+	return connected
 }
 
 // Close closes the connection to the TV.
@@ -267,7 +288,7 @@ func (c *Client) Register(ctx context.Context, store map[string]string) (<-chan 
 		payload[k] = v
 	}
 
-	if key, ok := store["client_key"]; ok {
+	if key, ok := store["client_key"]; ok && key != "" {
 		payload["client-key"] = key
 	}
 
@@ -306,10 +327,26 @@ func (c *Client) Register(ctx context.Context, store map[string]string) (<-chan 
 					return
 				}
 
+				if item.Type == "error" {
+					errMsg := item.Error
+					if errMsg == "" && len(item.Payload) > 0 {
+						var ep struct {
+							Error string `json:"error"`
+						}
+						if err := json.Unmarshal(item.Payload, &ep); err == nil {
+							errMsg = ep.Error
+						}
+					}
+					if errMsg == "" {
+						errMsg = string(item.Payload)
+					}
+					errChan <- fmt.Errorf("registration error: %s", errMsg)
+					return
+				}
+
 				var p struct {
 					PairingType string `json:"pairingType"`
 					ClientKey   string `json:"client-key"`
-					Error       string `json:"error"`
 				}
 				if err := json.Unmarshal(item.Payload, &p); err != nil {
 					errChan <- fmt.Errorf("failed to unmarshal registration payload: %w", err)
@@ -323,6 +360,9 @@ func (c *Client) Register(ctx context.Context, store map[string]string) (<-chan 
 					case <-ctx.Done():
 						errChan <- ctx.Err()
 						return
+					case <-c.ctx.Done():
+						errChan <- ErrConnectionClosed
+						return
 					}
 				case item.Type == "registered":
 					store["client_key"] = p.ClientKey
@@ -330,10 +370,9 @@ func (c *Client) Register(ctx context.Context, store map[string]string) (<-chan 
 					case statusChan <- Registered:
 					case <-ctx.Done():
 						errChan <- ctx.Err()
+					case <-c.ctx.Done():
+						errChan <- ErrConnectionClosed
 					}
-					return
-				case item.Type == "error":
-					errChan <- fmt.Errorf("registration error: %s", p.Error)
 					return
 				}
 			}
@@ -514,6 +553,7 @@ func (c *Client) writeMessage(ctx context.Context, msg Message) error {
 		return fmt.Errorf("failed to set write deadline: %w", err)
 	}
 	if err := conn.WriteJSON(msg); err != nil {
+		_ = c.Close()
 		return fmt.Errorf("failed to write JSON: %w", err)
 	}
 

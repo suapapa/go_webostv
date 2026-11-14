@@ -328,6 +328,81 @@ func TestClient_UnsubscribeDoesNotCreateWaiter(t *testing.T) {
 	}
 }
 
+func TestClient_IsConnected(t *testing.T) {
+	closedByServer := make(chan struct{})
+	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upgrader := websocket.Upgrader{}
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		<-closedByServer
+		_ = conn.Close()
+	}))
+	defer s.Close()
+
+	host := strings.TrimPrefix(s.URL, "http://")
+	client := NewClient(host)
+	if client.IsConnected() {
+		t.Fatal("expected IsConnected() == false before Connect")
+	}
+
+	if err := client.Connect(); err != nil {
+		t.Fatalf("failed to connect: %v", err)
+	}
+	if !client.IsConnected() {
+		t.Fatal("expected IsConnected() == true after Connect")
+	}
+
+	close(closedByServer)
+	deadline := time.Now().Add(2 * time.Second)
+	for client.IsConnected() && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if client.IsConnected() {
+		t.Fatal("expected IsConnected() == false after server close")
+	}
+}
+
+func TestClient_RegisterErrorWithEmptyPayload(t *testing.T) {
+	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upgrader := websocket.Upgrader{}
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer func() { _ = conn.Close() }()
+
+		_, data, err := conn.ReadMessage()
+		if err != nil {
+			return
+		}
+		var request Message
+		if err := json.Unmarshal(data, &request); err != nil {
+			return
+		}
+		_ = conn.WriteJSON(Message{
+			Type:  "error",
+			ID:    request.ID,
+			Error: "403 User rejected pairing",
+		})
+	}))
+	defer s.Close()
+
+	host := strings.TrimPrefix(s.URL, "http://")
+	client := NewClient(host)
+	if err := client.Connect(); err != nil {
+		t.Fatalf("failed to connect: %v", err)
+	}
+	defer closeClient(t, client)
+
+	_, errChan := client.Register(context.Background(), map[string]string{})
+	err := <-errChan
+	if err == nil || !strings.Contains(err.Error(), "403 User rejected pairing") {
+		t.Fatalf("expected registration error containing server message, got %v", err)
+	}
+}
+
 func closeClient(t *testing.T, client *Client) {
 	t.Helper()
 	if err := client.Close(); err != nil {
