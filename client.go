@@ -42,6 +42,7 @@ type Message struct {
 	Type    string          `json:"type"`
 	ID      string          `json:"id"`
 	URI     string          `json:"uri,omitempty"`
+	Error   string          `json:"error,omitempty"`
 	Payload json.RawMessage `json:"payload,omitempty"`
 }
 
@@ -370,6 +371,9 @@ func (c *Client) Request(ctx context.Context, uri string, payload interface{}) (
 			return nil, ErrConnectionClosed
 		}
 		if resp.Type == "error" {
+			if resp.Error != "" {
+				return nil, fmt.Errorf("%w: %s", ErrInvalidResponse, resp.Error)
+			}
 			return nil, fmt.Errorf("%w: %s", ErrInvalidResponse, string(resp.Payload))
 		}
 		return resp, nil
