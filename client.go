@@ -389,9 +389,13 @@ func (c *Client) SendMessage(
 		id = uuid.New().String()
 	}
 
-	rawPayload, err := json.Marshal(payload)
-	if err != nil {
-		return nil, "", fmt.Errorf("failed to marshal payload: %w", err)
+	var rawPayload json.RawMessage
+	if payload != nil {
+		var err error
+		rawPayload, err = json.Marshal(payload)
+		if err != nil {
+			return nil, "", fmt.Errorf("failed to marshal payload: %w", err)
+		}
 	}
 
 	msg := Message{
